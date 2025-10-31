@@ -1,0 +1,744 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<title>USD/JPY 15分足 予測（Multi-Feature＋BiLSTM＋外部要因｜XAU欠損対応｜Yahoo+AllOrigins＋Retry＋GPU＋IndexedDB）</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+
+<!-- Chart.js / TensorFlow.js -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+
+<style>
+  :root { --w: 1180px; }
+  body { font-family: system-ui,-apple-system,Segoe UI,Roboto,"Hiragino Sans",Meiryo,sans-serif; background:#fafafa; color:#222; margin:0; }
+  header { padding:16px; background:#fff; border-bottom:1px solid #eee; }
+  h1 { margin:0; font-size:20px; }
+  main { max-width:var(--w); margin:0 auto; padding:12px; }
+  .panel { background:#fff; border:1px solid #eee; border-radius:12px; padding:14px; margin:12px 0; }
+  .row { display:flex; flex-wrap:wrap; gap:12px; align-items:flex-end; }
+  label { font-size:12px; color:#555; display:block; margin-bottom:4px; }
+  input, button, select { font-size:14px; padding:8px 10px; }
+  button { border:1px solid #ddd; background:#fff; border-radius:10px; cursor:pointer; }
+  button.primary { background:#222; color:#fff; border-color:#222; }
+  #status { font-size:12px; color:#555; white-space:pre-line; }
+  .stats { display:flex; flex-wrap:wrap; gap:12px; }
+  .stat { flex:1 1 260px; background:#f7f7f9; border-radius:10px; padding:12px; }
+  .stat b { display:block; font-size:12px; color:#666; margin-bottom:6px; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; background:#eef; color:#223; margin-left:8px; }
+  .cards { display:grid; grid-template-columns: repeat(3, 1fr); gap:12px; }
+  .card { background:#fff; border:1px solid #eee; border-radius:12px; padding:14px; display:flex; flex-direction:column; gap:8px; }
+  .card h3 { margin:0; font-size:16px; }
+  .kv { font-size:22px; font-weight:700; }
+  .muted { color:#666; font-size:12px; }
+  .rationale { font-size:13px; color:#444; line-height:1.6; white-space:pre-line; }
+  canvas { max-width:100%; }
+  footer { text-align:center; font-size:12px; color:#888; padding:16px; }
+  @media (max-width: 980px){ .cards { grid-template-columns: 1fr; } }
+
+  /* 進捗バー */
+  .progress-box { margin-top:6px; }
+  .progress-label { font-size:12px; color:#555; margin-bottom:4px; }
+  .progress-bar-bg { background:#eee; border-radius:6px; height:8px; width:100%; position:relative; }
+  .progress-bar-fill { background:linear-gradient(90deg,#007bff,#00c6ff); height:100%; width:0%; border-radius:6px; transition:width .25s ease; }
+  .progress-text { font-size:12px; text-align:right; margin-top:2px; color:#333; }
+
+  /* ネットワーク状態 */
+  .net { display:flex; align-items:center; gap:8px; }
+  .dot { width:10px; height:10px; border-radius:50%; background:#999; box-shadow:0 0 0 2px #fff inset; }
+  .ok  { background:#20c997 !important; }
+  .slow{ background:#f0ad4e !important; }
+  .bad { background:#dc3545 !important; }
+</style>
+
+<!-- GPU自動（WebGPU→WebGL→CPU） -->
+<script>
+(async () => {
+  if (typeof tf === "undefined") return;
+  for (const b of ["webgpu","webgl","cpu"]) {
+    try { await tf.setBackend(b); await tf.ready(); console.log(`✅ TFJS backend=${b}`); document.title += ` | ${b.toUpperCase()}`; break; }
+    catch (e) { console.warn(`fallback backend: ${b} ->`, e.message); }
+  }
+})();
+</script>
+</head>
+
+<body>
+<header>
+  <h1>💱 USD/JPY 15分足 予測（Multi-Feature＋BiLSTM＋外部要因｜XAU欠損対応｜Yahoo+AllOrigins＋Retry＋GPU＋IndexedDB）</h1>
+</header>
+
+<main>
+  <!-- コントロール -->
+  <div class="panel">
+    <div class="row">
+      <div><label>lookback（本）</label><input id="lookback" type="number" min="32" value="64" /></div>
+      <div><label>epochs</label><input id="epochs" type="number" min="5" value="18" /></div>
+      <div><label>学習率</label><input id="lr" type="number" step="0.0001" value="0.001" /></div>
+      <div><label>保存上限（IndexedDB 件数）</label><input id="dbCap" type="number" min="5000" value="60000" /></div>
+      <div><label>Yahoo 範囲</label>
+        <select id="rangeSel">
+          <option value="5d" selected>過去5日（15m）</option>
+          <option value="1mo">過去1ヶ月（15m）</option>
+          <option value="3mo">過去3ヶ月（15m）</option>
+        </select>
+      </div>
+    </div>
+    <div class="row" style="margin-top:10px;">
+      <div><label>&nbsp;</label><button id="initBtn" class="primary">初期取得（USDJPY/DXY/XAU → DB）</button></div>
+      <div><label>&nbsp;</label><button id="startBtn">学習＋予測を実行</button></div>
+      <div><label>&nbsp;</label><button id="autoBtn">自動更新: OFF</button></div>
+      <div><label>更新方式</label>
+        <select id="autoMode">
+          <option value="adaptive" selected>15分境界に合わせる（推奨）</option>
+          <option value="fixed">固定間隔</option>
+        </select>
+      </div>
+      <div><label>固定間隔（分）</label><input id="intervalMin" type="number" min="1" value="1" /></div>
+      <div><label>&nbsp;</label><button id="clearBtn">保存データ削除（IndexedDB）</button></div>
+    </div>
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-top:8px;">
+      <div id="status">準備OK：『初期取得』→『学習＋予測』の順で実行。XAU欠損でも自動補完＆再試行します。</div>
+      <div class="net"><div id="netDot" class="dot"></div><span id="netText" style="font-size:12px;color:#555;">未計測</span></div>
+    </div>
+  </div>
+
+  <!-- 概況 -->
+  <div class="panel">
+    <div class="stats">
+      <div class="stat"><b>最新15分バー（Close）</b><span id="curPrice" class="kv">-</span> <span id="latestSrc" class="badge" style="display:none;"></span></div>
+      <div class="stat"><b>学習状況</b><span id="trainState">idle</span></div>
+      <div class="stat"><b>最終学習損失（15m／60m／240m）</b><span id="lossPack">- / - / -</span></div>
+    </div>
+  </div>
+
+  <!-- 3カード -->
+  <div class="cards">
+    <div class="card" id="card15">
+      <h3>短期：15分後</h3>
+      <div class="kv" id="pred15">-</div>
+      <div class="muted" id="trend15">傾向：-</div>
+      <div class="rationale" id="rat15" style="display:none;"></div>
+      <div class="progress-box">
+        <div class="progress-label">学習進行</div>
+        <div class="progress-bar-bg"><div class="progress-bar-fill" id="bar-15"></div></div>
+        <div class="progress-text" id="text-15">0%</div>
+      </div>
+    </div>
+    <div class="card" id="card60">
+      <h3>中期：1時間後</h3>
+      <div class="kv" id="pred60">-</div>
+      <div class="muted" id="trend60">傾向：-</div>
+      <div class="rationale" id="rat60" style="display:none;"></div>
+      <div class="progress-box">
+        <div class="progress-label">学習進行</div>
+        <div class="progress-bar-bg"><div class="progress-bar-fill" id="bar-60"></div></div>
+        <div class="progress-text" id="text-60">0%</div>
+      </div>
+    </div>
+    <div class="card" id="card240">
+      <h3>長期：4時間後</h3>
+      <div class="kv" id="pred240">-</div>
+      <div class="muted" id="trend240">傾向：-</div>
+      <div class="rationale" id="rat240" style="display:none;"></div>
+      <div class="progress-box">
+        <div class="progress-label">学習進行</div>
+        <div class="progress-bar-bg"><div class="progress-bar-fill" id="bar-240"></div></div>
+        <div class="progress-text" id="text-240">0%</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- チャート -->
+  <div class="panel"><canvas id="chart" height="380"></canvas></div>
+</main>
+
+<footer>© USD/JPY 15m Predictor — BiLSTM + DXY & XAU（欠損補完） + Yahoo(AllOrigins) + Retry + IndexedDB + WebGPU</footer>
+
+<script>
+/* ========= Utils ========= */
+const $ = (id)=>document.getElementById(id);
+const log = (m)=>{ $("status").textContent = m; };
+const appendLog = (m)=>{ $("status").textContent += "\\n" + m; };
+const mean = (a)=> a.length? a.reduce((x,y)=>x+y,0)/a.length : 0;
+const std  = (a)=> { if(!a.length) return 1e-8; const m = mean(a); const v= mean(a.map(v=> (v-m)*(v-m))); return Math.sqrt(v)||1e-8; };
+const toHHMM = (d)=> new Date(d).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"});
+const isNum  = (v)=> Number.isFinite(v);
+
+/* ========= Network (Retry + Timeout + Indicator) ========= */
+function setNet(statusMs, ok){
+  const dot=$("netDot"), t=$("netText");
+  if(!ok){ dot.className="dot bad"; t.textContent="失敗"; return; }
+  if(statusMs>2500){ dot.className="dot slow"; t.textContent=`遅延 ${statusMs.toFixed(0)}ms`; }
+  else { dot.className="dot ok"; t.textContent=`良好 ${statusMs.toFixed(0)}ms`; }
+}
+async function fetchWithRetry(url, {timeout=12000, retries=2, backoff=900}={}){
+  let err;
+  for(let i=0;i<=retries;i++){
+    const controller = new AbortController();
+    const timer = setTimeout(()=>controller.abort(), timeout);
+    const t0 = performance.now();
+    try{
+      const res = await fetch(url, {signal:controller.signal, cache:"no-store"});
+      clearTimeout(timer);
+      const dt = performance.now()-t0;
+      if(!res.ok) throw new Error(`HTTP ${res.status}`);
+      setNet(dt, true);
+      const txt = await res.text();
+      return { text: txt, latency: dt };
+    }catch(e){
+      clearTimeout(timer);
+      err = e;
+      setNet(performance.now()-t0, false);
+      if(i<retries) await new Promise(r=>setTimeout(r, backoff*Math.pow(1.6,i)));
+    }
+  }
+  throw err;
+}
+
+/* ========= Yahoo endpoints ========= */
+function yChart(symbol, range="5d", interval="15m"){
+  return `https://query1.finance.yahoo.com/v7/finance/chart/${encodeURIComponent(symbol)}?range=${range}&interval=${interval}&indicators=quote&includeTimestamps=true&_=${Date.now()}`;
+}
+const AO_raw = (url)=> `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`;
+const AO_get = (url)=> `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`;
+
+async function fetchYahooSeries(symbols, range="5d", interval="15m"){
+  const errors=[];
+  for(const sym of symbols){
+    const targets = [
+      {type:"direct", url:yChart(sym,range,interval)},
+      {type:"raw",    url:AO_raw(yChart(sym,range,interval))},
+      {type:"get",    url:AO_get(yChart(sym,range,interval)), wrapper:true}
+    ];
+    for(const t of targets){
+      try{
+        const {text} = await fetchWithRetry(t.url);
+        const json = t.wrapper ? JSON.parse(JSON.parse(text).contents) : JSON.parse(text);
+        const r = json?.chart?.result?.[0];
+        const ts = r?.timestamp || [];
+        const q  = r?.indicators?.quote?.[0] || {};
+        if(!ts.length || !q?.close?.length) throw new Error("データ欠落");
+        const rows=[];
+        for(let i=0;i<ts.length;i++){
+          const c=q.close[i]; if(!isNum(c)) continue;
+          rows.push({
+            ts: ts[i]*1000,
+            open: Number(q.open?.[i] ?? c),
+            high: Number(q.high?.[i] ?? c),
+            low : Number(q.low ?. [i] ?? c),
+            close:Number(c),
+            hhmm: toHHMM(ts[i]*1000)
+          });
+        }
+        if(rows.length){ appendLog(`${sym} 取得: ${t.type} 経由 ${rows.length}件`); return {symbol:sym, rows}; }
+      }catch(e){ errors.push(`${sym}/${t?.type||"start"}: ${e.message}`); }
+    }
+  }
+  throw new Error("Yahoo fetch failed: " + errors.slice(0,3).join(" | "));
+}
+
+/* ========= Fallback latest snapshot ========= */
+async function fetchLatestFallback(){
+  const tries = [
+    async()=>{ const j=JSON.parse((await fetchWithRetry(`https://api.exchangerate.host/latest?base=USD&symbols=JPY&places=6`)).text); return {v:j?.rates?.JPY, src:"exchangerate.host"}; },
+    async()=>{ const j=JSON.parse((await fetchWithRetry(`https://api.frankfurter.app/latest?from=USD&to=JPY`)).text); return {v:j?.rates?.JPY, src:"frankfurter.app"}; },
+  ];
+  for(const t of tries){
+    try{ const {v,src}=await t(); if(isNum(v)) return {v,src}; }catch(e){}
+  }
+  throw new Error("最新値取得失敗");
+}
+
+/* ========= IndexedDB ========= */
+let db;
+const DB_NAME="usd_jpy_15m_db_pro_xau_safe", DB_VER=1, STORE="bars15";
+function openDB(){ return new Promise((res,rej)=>{ const r=indexedDB.open(DB_NAME,DB_VER);
+  r.onupgradeneeded=e=>{const d=e.target.result; if(!d.objectStoreNames.contains(STORE)){ const s=d.createObjectStore(STORE,{keyPath:"ts"}); s.createIndex("by_ts","ts",{unique:true}); }};
+  r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error||new Error("DB open error")); }); }
+function withStore(db,mode,fn){ return new Promise((res,rej)=>{ const tx=db.transaction(STORE,mode); const s=tx.objectStore(STORE); const p=fn(s); tx.oncomplete=()=>res(p); tx.onerror=()=>rej(tx.error||new Error("TX error")); }); }
+async function dbBulkPut(rows){ return withStore(db,"readwrite",s=>rows.forEach(b=>s.put(b))); }
+async function dbAddBar(b){ return withStore(db,"readwrite",s=>s.put(b)); }
+async function dbGetAll(){ return new Promise((res,rej)=>{ const out=[]; const tx=db.transaction(STORE,"readonly"); const s=tx.objectStore(STORE).index("by_ts"); s.openCursor().onsuccess=e=>{const c=e.target.result; if(c){out.push(c.value); c.continue();}}; tx.oncomplete=()=>res(out); tx.onerror=()=>rej(tx.error); }); }
+async function dbCount(){ return withStore(db,"readonly",s=>new Promise((r,j)=>{ const c=s.count(); c.onsuccess=()=>r(c.result); c.onerror=()=>j(c.error);})); }
+async function dbTrimOld(keep){ const total=await dbCount(); if(total<=keep) return; const rm=total-keep;
+  await withStore(db,"readwrite",s=>new Promise((r,j)=>{ const idx=s.index("by_ts"); let n=0; idx.openCursor().onsuccess=e=>{const c=e.target.result; if(c&&n<rm){s.delete(c.primaryKey); n++; c.continue();} }; s.transaction.oncomplete=()=>r(); s.transaction.onerror=e=>j(e.target.error);})); }
+async function dbClear(){ return withStore(db,"readwrite",s=>s.clear()); }
+
+/* ========= Series in memory ========= */
+let times15=[], closes15=[], opens15=[], highs15=[], lows15=[], timeTsArr=[];
+let externalMap={}; // { ts(ms): {dxy, xau} }
+
+/* ========= Indicators ========= */
+function ema(arr, span){ const k=2/(span+1); let e=arr[0]; for(let i=1;i<arr.length;i++) e = arr[i]*k + e*(1-k); return e; }
+function emaSeries(arr, span){ const out=[]; let e=arr[0]; const k=2/(span+1); for(let i=0;i<arr.length;i++){ e = i? (arr[i]*k + e*(1-k)) : arr[0]; out.push(e);} return out; }
+function rsi(arr, period=14){ const out=new Array(arr.length).fill(null); if(arr.length<=period) return out;
+  let gains=0,losses=0; for(let i=1;i<=period;i++){ const d=arr[i]-arr[i-1]; if(d>=0) gains+=d; else losses-=d; }
+  let avgG=gains/period, avgL=losses/period; out[period]= 100 - 100/(1+(avgG/(avgL||1e-8)));
+  for(let i=period+1;i<arr.length;i++){ const d=arr[i]-arr[i-1]; const g=Math.max(d,0), l=Math.max(-d,0);
+    avgG=(avgG*(period-1)+g)/period; avgL=(avgL*(period-1)+l)/period;
+    out[i]= 100 - 100/(1+(avgG/(avgL||1e-8)));
+  } return out;
+}
+function macd(arr, fast=12, slow=26, signal=9){
+  const emaF=emaSeries(arr,fast), emaS=emaSeries(arr,slow);
+  const macdLine=emaF.map((v,i)=>v-(emaS[i]??v));
+  const sigSeries=emaSeries(macdLine.map(v=>isNum(v)?v:0), signal);
+  const sigAlign=macdLine.map((_,i)=>sigSeries[i] ?? sigSeries.at(-1) ?? 0);
+  const hist=macdLine.map((v,i)=>(isNum(v)?v:0) - (sigAlign[i]??0));
+  return { macdLine: macdLine.map(v=>isNum(v)?v:0), signalLine: sigAlign, hist };
+}
+
+/* ========= Feature engineering ========= */
+function buildFeatureFrameFull(){
+  const n = closes15.length;
+  const frame = [];
+  const delta = (i)=> (i>0 && isNum(closes15[i-1])) ? (closes15[i]/closes15[i-1] - 1) : 0;
+
+  const ma5=[], ma20=[], vol5=[];
+  for(let i=0;i<n;i++){
+    const w5=closes15.slice(Math.max(0,i-4), i+1);
+    const w20=closes15.slice(Math.max(0,i-19), i+1);
+    ma5.push(mean(w5)); ma20.push(mean(w20)); vol5.push(std(w5));
+  }
+  const e5=emaSeries(closes15,5), e20=emaSeries(closes15,20);
+  const emadiff=e5.map((v,i)=> (v - (e20[i]??v)));
+
+  const hl_range = highs15.map((h,i)=> isNum(h)&&isNum(lows15[i]) ? (h - lows15[i]) : 0);
+  const co_diff  = closes15.map((c,i)=> isNum(c)&&isNum(opens15[i]) ? (c - opens15[i]) : 0);
+  const rsi14    = rsi(closes15,14);
+  const mac      = macd(closes15,12,26,9);
+
+  for(let i=0;i<n;i++){
+    const price=closes15[i]; if(!isNum(price)) continue;
+    frame.push({
+      price,
+      dlt: delta(i),
+      ma5: ma5[i], ma20: ma20[i], vol5: vol5[i],
+      emadiff: emadiff[i],
+      open: opens15[i] ?? price,
+      high: highs15[i] ?? price,
+      low : lows15[i]  ?? price,
+      hl_range: hl_range[i] ?? 0,
+      co_diff : co_diff[i] ?? 0,
+      rsi14   : isNum(rsi14[i]) ? rsi14[i] : 50,
+      macd    : isNum(mac.macdLine[i]) ? mac.macdLine[i] : 0,
+      macdsig : isNum(mac.signalLine[i])? mac.signalLine[i]: 0,
+      dxy     : 0, dxy_dlt: 0,
+      xau     : 0, xau_dlt: 0
+    });
+  }
+  return frame;
+}
+
+// 外部要因を時刻マージ（欠損は直近値で補完）
+function alignExternal(frame, extMap){
+  const FIFTEEN=15*60*1000;
+  let lastDXY=null, lastXAU=null;
+  for(let i=0;i<frame.length;i++){
+    const ts=timeTsArr[i];
+    let hit=null, best=Infinity;
+    for(const k in extMap){
+      const diff=Math.abs(ts-Number(k));
+      if(diff<=FIFTEEN && diff<best){ best=diff; hit=extMap[k]; }
+    }
+    if(hit){
+      if(isNum(hit.dxy)) lastDXY=hit.dxy;
+      if(isNum(hit.xau)) lastXAU=hit.xau;
+    }
+    // 補完（直近値が無ければ前のframeから拾う／それも無ければスキップ値0ではなくpriceで代用）
+    frame[i].dxy = isNum(lastDXY) ? lastDXY : (frame[i-1]?.dxy ?? frame[i].price);
+    frame[i].xau = isNum(lastXAU) ? lastXAU : (frame[i-1]?.xau ?? frame[i].price);
+  }
+  for(let i=1;i<frame.length;i++){
+    frame[i].dxy_dlt = isNum(frame[i-1].dxy) && frame[i-1].dxy!==0 ? (frame[i].dxy/frame[i-1].dxy - 1) : 0;
+    frame[i].xau_dlt = isNum(frame[i-1].xau) && frame[i-1].xau!==0 ? (frame[i].xau/frame[i-1].xau - 1) : 0;
+  }
+  return frame;
+}
+
+/* ========= Normalization / dataset ========= */
+function fitNorm(vec){
+  const clean = vec.filter(v=>isNum(v));
+  if(!clean.length) return { m:0, s:1 };
+  return { m: mean(clean), s: std(clean)||1e-8 };
+}
+function makeXyFromFrame(frame, lookback, horizon, keys){
+  const X=[], y=[];
+  for(let i=0;i<frame.length - lookback - horizon; i++){
+    const win=frame.slice(i, i+lookback);
+    if(!keys.every(k=> win.every(r=>isNum(r[k])))) continue;
+    const target=frame[i+lookback+horizon].price;
+    if(!isNum(target)) continue;
+    X.push(win.map(row => keys.map(k=>row[k])));
+    y.push(target);
+  }
+  return {X,y};
+}
+
+/* ========= BiLSTM ========= */
+function buildBiLSTM(inputLen, nFeat, lr){
+  const m=tf.sequential();
+  m.add(tf.layers.bidirectional({
+    layer: tf.layers.lstm({units:64, returnSequences:true}),
+    inputShape:[inputLen, nFeat]
+  }));
+  m.add(tf.layers.bidirectional({
+    layer: tf.layers.lstm({units:32, returnSequences:false})
+  }));
+  m.add(tf.layers.dropout({rate:0.2}));
+  m.add(tf.layers.dense({units:32, activation:"relu"}));
+  m.add(tf.layers.dense({units:1}));
+  m.compile({optimizer:tf.train.adam(lr), loss:"meanSquaredError"});
+  return m;
+}
+
+/* ========= Progress bars ========= */
+function updateProgressBar(label, progress, lossText){
+  const map={ "15分":"15", "1時間":"60", "4時間":"240" };
+  const key=map[label];
+  const bar=$(`bar-${key}`), txt=$(`text-${key}`);
+  if(bar) bar.style.width=`${Math.max(0,Math.min(100,progress))}%`;
+  if(txt) txt.textContent = `${progress.toFixed(0)}%　(loss=${lossText})`;
+}
+
+/* ========= Chart ========= */
+let chart;
+function drawChart(labels, values, preds={}){
+  const canvas = $("chart");
+  const existing = Chart.getChart(canvas);
+  if (existing) existing.destroy();
+
+  const labs=labels.slice();
+  const datasets=[{ label:"USD/JPY（15分足 Close）", data:values, borderWidth:2, pointRadius:0, tension:0.2 }];
+
+  const addPredPoint=(lbl,val,color="#f66")=>{
+    if(!isNum(val)) return;
+    labs.push(lbl);
+    const arr=new Array(values.length + (labs.length-labels.length)).fill(null);
+    arr[arr.length-1]=val;
+    datasets.push({ label:`予測${lbl}`, data:arr, pointRadius:5, borderWidth:0, borderColor:color });
+  };
+  if(isNum(preds.m15)) addPredPoint("(+15分)", preds.m15);
+
+  if(Array.isArray(preds.future) && preds.future.length){
+    const arr=new Array(values.length).fill(null).concat(preds.future);
+    const futLabels = preds.future.map((_,i)=>`+${(i+1)*15}m`);
+    labs.push(...futLabels);
+    datasets.push({ label:"1時間先 予測ライン", data:arr, borderColor:"#e00000", borderDash:[6,3], tension:0.3, pointRadius:3 });
+  }
+
+  new Chart(canvas,{ type:"line", data:{labels:labs, datasets}, options:{ responsive:true, maintainAspectRatio:false } });
+}
+
+/* ========= Rationale ========= */
+function linregSlope(arr){ const n=arr.length, mx=(n-1)/2, my=mean(arr); let num=0,den=0; for(let i=0;i<n;i++){const dx=i-mx; num+=dx*(arr[i]-my); den+=dx*dx;} return den?num/den:0; }
+function rationaleText(winPrices, cur, pred, fLast){
+  const minV=Math.min(...winPrices), maxV=Math.max(...winPrices), avg=mean(winPrices), vol=std(winPrices);
+  const mom=winPrices.at(-1)-winPrices[0], slope=linregSlope(winPrices);
+  const cross = (fLast.emadiff>0) ? "短期>長期（上昇）" : (fLast.emadiff<0) ? "短期<長期（下降）" : "拮抗";
+  const delta=pred-cur, bps=cur?(delta/cur*10000):0;
+  const dxyP=(fLast.dxy_dlt*100).toFixed(2), xauP=(fLast.xau_dlt*100).toFixed(2);
+  return `• 入力窓: ${winPrices.length} 本
+• 価格範囲: ${minV.toFixed(4)}〜${maxV.toFixed(4)} / 平均 ${avg.toFixed(4)} / 標準偏差 ${vol.toFixed(4)}
+• 回帰傾き: ${slope.toFixed(6)} / モメンタム: ${mom>=0?"+":""}${mom.toFixed(4)}
+• EMA差(5-20): ${fLast.emadiff>=0?"+":""}${fLast.emadiff.toFixed(5)} → ${cross}
+• 予測差分: ${delta>=0?"+":""}${delta.toFixed(4)}（約 ${bps.toFixed(1)} bps）
+• 外部要因: DXYΔ=${dxyP}%, XAUΔ=${xauP}%`;
+}
+
+/* ========= Core Train & Predict ========= */
+const keyIndex={}; // not used anymore but kept for clarity
+
+async function trainAndPredictSingle(horizon, label, keep=false, keys){
+  const lookback=parseInt($("lookback").value)||64;
+  const epochs  =parseInt($("epochs").value)||18;
+  const lr      =parseFloat($("lr").value)||0.001;
+
+  let frame = buildFeatureFrameFull();
+  frame = alignExternal(frame, externalMap);
+
+  // 学習用データセット
+  const {X,y}=makeXyFromFrame(frame, lookback, horizon, keys);
+  if(X.length<10){ throw new Error(`${label}: 学習サンプル不足(${X.length})`); }
+
+  // 正規化
+  // 特徴列ごとにflattenしてfit
+  const nFeat=keys.length;
+  const featCols = Array.from({length:nFeat}, (_,j)=> {
+    const col=[]; for(const win of X){ for(const vec of win){ col.push(vec[j]); } }
+    return col;
+  });
+  const fits = featCols.map(col=>fitNorm(col));
+  const Xn = X.map(win=> win.map(vec => vec.map((v,j)=> (v - fits[j].m)/(fits[j].s||1e-8))));
+  const fitY = fitNorm(y);
+  const yn = y.map(v=>(v - fitY.m)/(fitY.s||1e-8));
+
+  const tx=tf.tensor3d(Xn), ty=tf.tensor2d(yn,[yn.length,1]);
+  const model=buildBiLSTM(lookback, nFeat, lr);
+
+  updateProgressBar(label,0,"-"); $("trainState").textContent=`training (${label})`;
+  const hist=await model.fit(tx,ty,{epochs,verbose:0,batchSize:Math.min(128,Math.max(16,Math.floor(Xn.length/10))),callbacks:{
+    onEpochEnd:(e,logs)=>{ const loss = logs?.loss; updateProgressBar(label,(e+1)/epochs*100, isNum(loss)? loss.toFixed(4):"NaN"); }
+  }});
+  const lossVal=hist.history?.loss?.at(-1);
+  const lossText = isNum(lossVal) ? (lossVal.toExponential?.(2) ?? String(lossVal)) : "NaN";
+  updateProgressBar(label,100, lossText); $("trainState").textContent="idle";
+
+  // 1点予測
+  const lastWin = frame.slice(-lookback).map(row => keys.map(k=>row[k]));
+  const lastWinN= lastWin.map(vec=>vec.map((v,j)=>(v - fits[j].m)/(fits[j].s||1e-8)));
+  const px=tf.tensor3d([lastWinN]);
+  const pN=(await model.predict(px).array())[0][0];
+  const pred = pN*(fitY.s||1e-8)+fitY.m;
+  px.dispose(); tx.dispose(); ty.dispose();
+
+  const lookPrices=closes15.slice(-lookback);
+  const lastFeat=frame.at(-1);
+  const cur=closes15.at(-1);
+  const pack = {
+    pred, loss: isNum(lossVal)?lossVal:NaN,
+    trend: isNum(pred)&&isNum(cur) ? ((pred>cur)?"上昇 📈":(pred<cur)?"下降 📉":"横ばい ➖") : "-",
+    rationale: rationaleText(lookPrices, cur, pred, lastFeat),
+    model, fits, fitY, keys, frame, lookback
+  };
+  if(!keep){ model.dispose(); }
+  return pack;
+}
+
+// 未来 n ステップ（15分×n）再帰予測（外部要因は据え置き）
+async function multiStepForecast(pack15, steps){
+  const { model, fits, fitY, keys, frame, lookback } = pack15;
+  let winFeat = frame.slice(-lookback).map(r=>({...r}));
+  const preds=[];
+  for(let i=0;i<steps;i++){
+    const lastWinN = winFeat.map(vec => keys.map((k,j)=> (vec[k]-fits[j].m)/(fits[j].s||1e-8)));
+    const px=tf.tensor3d([lastWinN]);
+    const pN=(await model.predict(px).array())[0][0];
+    const pred = pN*(fitY.s||1e-8)+fitY.m;
+    preds.push(pred);
+    px.dispose();
+
+    // 価格を更新（外部要因は最新のまま）
+    const priceWindow = winFeat.map(v=>v.price).slice(1).concat(pred);
+    const n=priceWindow.length;
+    const win5=priceWindow.slice(-5), win20=priceWindow.slice(-20);
+    const newRow = {
+      ...winFeat.at(-1),
+      price: pred,
+      dlt: n>1? (priceWindow[n-1]/priceWindow[n-2]-1) : 0,
+      ma5: mean(win5), ma20: mean(win20), vol5: std(win5),
+      emadiff: ema(win5, Math.min(5,win5.length)) - ema(win20, Math.min(20,win20.length)),
+    };
+    winFeat = winFeat.slice(1).concat(newRow);
+  }
+  return preds;
+}
+
+/* ========= Chart/UI glue ========= */
+function updateUIAfterPredict(pack, future){
+  const { r15, r60, r240 } = pack;
+  $("pred15").textContent = isNum(r15.pred)? r15.pred.toFixed(4) : "-";
+  $("trend15").textContent = "傾向：" + r15.trend;
+  $("rat15").textContent = r15.rationale; $("rat15").style.display="block";
+
+  $("pred60").textContent = isNum(r60.pred)? r60.pred.toFixed(4) : "-";
+  $("trend60").textContent = "傾向：" + r60.trend;
+  $("rat60").textContent = r60.rationale; $("rat60").style.display="block";
+
+  $("pred240").textContent = isNum(r240.pred)? r240.pred.toFixed(4) : "-";
+  $("trend240").textContent = "傾向：" + r240.trend;
+  $("rat240").textContent = r240.rationale; $("rat240").style.display="block";
+
+  const l15 = isNum(r15.loss)? r15.loss.toExponential(2):"NaN";
+  const l60 = isNum(r60.loss)? r60.loss.toExponential(2):"NaN";
+  const l240= isNum(r240.loss)? r240.loss.toExponential(2):"NaN";
+  $("lossPack").textContent = `${l15} / ${l60} / ${l240}`;
+  drawChart(times15, closes15, { m15:r15.pred, future });
+}
+
+/* ========= Pipeline ========= */
+const USDJPY_SYM = ["USDJPY=X"];
+const DXY_SYMS   = ["DX=F","DX-Y.NYB","^DXY"];
+// XAU は最長系列を選ぶ（複数候補）
+const XAU_CANDIDATES = [
+  ["XAUUSD=X","GC=F","XAU=X"],        // 第1候補グループ
+  ["GC=F","XAUUSD=X","XAU=X"]         // 第2（順序入替）リトライ用
+];
+
+let autoHandle=null, adaptiveTimer=null;
+function msUntilNext15m(){ const now=new Date(); const m=now.getUTCMinutes(); const add=15-(m%15); const next=new Date(now); next.setUTCMinutes(m+add,0,0); return Math.max(10_000,next-now); }
+function msUntilNext15mChase(){ return Math.max(10_000, msUntilNext15m()+30_000); }
+
+async function initialFetchToDB(){
+  if(!db) db=await openDB();
+  const range=$("rangeSel").value || "5d";
+  log("Yahoo 15分足（USDJPY/DXY/XAU）を取得中…");
+  try{
+    const usd = await fetchYahooSeries(USDJPY_SYM, range, "15m");
+    await dbBulkPut(usd.rows);
+    await dbTrimOld(parseInt($("dbCap").value)||60000);
+
+    // DXY
+    let dxyRows=null;
+    try{ const dxyRes=await fetchYahooSeries(DXY_SYMS, range, "15m"); dxyRows=dxyRes.rows; }catch(e){ appendLog("DXY取得失敗"); }
+
+    // XAU: 複数戦略で最長を採用
+    let xauRows=null, bestLen=0;
+    for(const group of XAU_CANDIDATES){
+      try{
+        const r=await fetchYahooSeries(group, range, "15m");
+        if(r.rows.length>bestLen){ xauRows=r.rows; bestLen=r.rows.length; }
+      }catch(e){ /* try next */ }
+    }
+    if(!xauRows){ appendLog("XAU取得失敗（後で最新追撃）"); }
+
+    // 外部要因マップ
+    externalMap={};
+    const pushExt=(arr,key)=>{ if(!arr) return; for(const r of arr){ externalMap[r.ts]={...(externalMap[r.ts]||{}), [key]:r.close}; } };
+    pushExt(dxyRows, "dxy"); pushExt(xauRows,"xau");
+
+    log(`✅ 初期取得成功：USDJPY=${usd.rows.length}件 / DXY=${dxyRows?dxyRows.length:"-"} / XAU=${xauRows?xauRows.length:"-"}`);
+  }catch(e){
+    console.error(e);
+    log("⚠️ 初期取得に失敗。一部のみ保存された可能性があります。以降の学習でfallback値を利用します。");
+  }
+  await loadFromDBToMemory();
+}
+
+async function loadFromDBToMemory(){
+  const all=await dbGetAll();
+  if(all.length){
+    times15=all.map(r=>r.hhmm);
+    opens15=all.map(r=>r.open); highs15=all.map(r=>r.high); lows15=all.map(r=>r.low);
+    closes15=all.map(r=>r.close); timeTsArr=all.map(r=>r.ts);
+    drawChart(times15, closes15, {});
+    $("curPrice").textContent=isNum(closes15.at(-1))? closes15.at(-1).toFixed(4) : "-";
+    log(`復元：DB ${all.length}件。`);
+  }else{
+    log("保存データなし。『初期取得』で取り込んでください。");
+  }
+}
+
+async function appendLatestBar(){
+  const lastHH=times15.at(-1);
+  const now=new Date(); const rounded=new Date(now.getTime());
+  rounded.setUTCMinutes(now.getUTCMinutes() - (now.getUTCMinutes()%15), 0, 0);
+  const hhmm=toHHMM(rounded.getTime());
+  if(lastHH===hhmm) return null;
+
+  try{
+    const usd = await fetchYahooSeries(USDJPY_SYM, "1d", "15m");
+    const last=usd.rows.at(-1);
+    if(last){
+      await dbAddBar(last);
+      times15.push(last.hhmm); opens15.push(last.open); highs15.push(last.high); lows15.push(last.low); closes15.push(last.close); timeTsArr.push(last.ts);
+      $("latestSrc").style.display="inline-block"; $("latestSrc").textContent="最新: Yahoo 15m";
+      // 外部も更新トライ
+      try{
+        const [dxyRes, xauTry1] = await Promise.allSettled([
+          fetchYahooSeries(DXY_SYMS,"1d","15m"),
+          fetchYahooSeries(["XAUUSD=X","GC=F","XAU=X"],"1d","15m")
+        ]);
+        if(dxyRes.status==="fulfilled"){ const r=dxyRes.value.rows.at(-1); externalMap[r.ts]={...(externalMap[r.ts]||{}), dxy:r.close}; }
+        if(xauTry1.status==="fulfilled"){ const r=xauTry1.value.rows.at(-1); externalMap[r.ts]={...(externalMap[r.ts]||{}), xau:r.close}; }
+      }catch(e){}
+      return last.close;
+    }
+  }catch(e){ console.warn("Yahoo最新失敗→fallback", e.message); }
+
+  try{
+    const {v,src}=await fetchLatestFallback();
+    const b={ts:rounded.getTime(), hhmm, open:v, high:v, low:v, close:v};
+    await dbAddBar(b);
+    times15.push(hhmm); opens15.push(v); highs15.push(v); lows15.push(v); closes15.push(v); timeTsArr.push(b.ts);
+    $("latestSrc").style.display="inline-block"; $("latestSrc").textContent=`最新: ${src}`;
+    return v;
+  }catch(e){ console.error("最新も失敗", e.message); return null; }
+}
+
+async function trainAndPredictMulti(){
+  const keys = [
+    "price","dlt","ma5","ma20","vol5","emadiff",
+    "open","high","low","hl_range","co_diff",
+    "rsi14","macd","macdsig",
+    "dxy","dxy_dlt","xau","xau_dlt"
+  ];
+  const r15  = await trainAndPredictSingle(1,  "15分", true,  keys);
+  const r60  = await trainAndPredictSingle(4,  "1時間", false, keys);
+  const r240 = await trainAndPredictSingle(16, "4時間", false, keys);
+  const future = await multiStepForecast(r15, 4);
+  r15.model.dispose();
+  return { r15, r60, r240, future };
+}
+
+function updateAllUI(pack){
+  updateUIAfterPredict(pack, pack.future);
+}
+
+async function oneCycle(){
+  if(!db) db=await openDB();
+  const v=await appendLatestBar();
+  if(isNum(v)) $("curPrice").textContent=v.toFixed(4);
+
+  const lookback=parseInt($("lookback").value)||64;
+  if(closes15.length < (lookback + 30)){
+    appendLog("データ不足のため学習スキップ（初回収集中）");
+    drawChart(times15, closes15, {});
+    return;
+  }
+  try{
+    const pack=await trainAndPredictMulti();
+    updateAllUI(pack);
+    log(`完了：bars=${closes15.length} / 現在=${isNum(closes15.at(-1))?closes15.at(-1).toFixed(4):"-"}`);
+    await dbTrimOld(parseInt($("dbCap").value)||60000);
+  }catch(e){ console.error(e); appendLog("学習エラー: " + e.message); }
+}
+
+/* ========= Auto update (adaptive/fixed) ========= */
+
+$("autoBtn").onclick = async ()=>{
+  const mode = $("autoMode").value;
+  if(mode==="adaptive"){
+    if(adaptiveTimer){ clearTimeout(adaptiveTimer); adaptiveTimer=null; $("autoBtn").textContent="自動更新: OFF"; appendLog("自動更新OFF（適応型）"); }
+    else{
+      if(times15.length===0) await loadFromDBToMemory();
+      $("autoBtn").textContent="自動更新: ON";
+      appendLog("自動更新ON（適応型：15分境界で更新＋追撃チェック）");
+      await oneCycle();
+      const loop=async ()=>{ await oneCycle(); adaptiveTimer=setTimeout(loop, msUntilNext15mChase()); };
+      adaptiveTimer=setTimeout(loop, msUntilNext15mChase());
+    }
+  }else{
+    if(fixedTimer){ clearInterval(fixedTimer); fixedTimer=null; $("autoBtn").textContent="自動更新: OFF"; appendLog("自動更新OFF（固定）"); }
+    else{
+      if(times15.length===0) await loadFromDBToMemory();
+      const m=Math.max(1, parseInt($("intervalMin").value)||1);
+      $("autoBtn").textContent="自動更新: ON";
+      appendLog(`自動更新ON（固定：${m}分）`);
+      await oneCycle();
+      fixedTimer=setInterval(oneCycle, m*60*1000);
+    }
+  }
+};
+
+/* ========= Buttons ========= */
+$("initBtn").onclick = async ()=>{ if(!db) db=await openDB(); await initialFetchToDB(); };
+$("startBtn").onclick = async ()=>{ if(!db) db=await openDB(); if(times15.length===0) await loadFromDBToMemory(); await oneCycle(); };
+$("clearBtn").onclick = async ()=>{
+  if(!db) db=await openDB();
+  if(confirm("IndexedDBの保存データをすべて削除しますか？")){
+    await dbClear();
+    times15=[]; opens15=[]; highs15=[]; lows15=[]; closes15=[]; timeTsArr=[]; externalMap={};
+    const c=Chart.getChart("chart"); if(c) c.destroy();
+    $("curPrice").textContent="-"; $("lossPack").textContent="- / - / -";
+    ["15","60","240"].forEach(s=>{ $(`pred${s}`).textContent="-"; $(`trend${s}`).textContent="傾向：-"; $(`rat${s}`).style.display="none"; updateProgressBar(s==="15"?"15分":s==="60"?"1時間":"4時間",0,"-"); });
+    log("IndexedDBを初期化しました。");
+  }
+};
+
+/* ========= Startup ========= */
+window.addEventListener("load", async ()=>{ db=await openDB(); await loadFromDBToMemory(); });
+</script>
+</body>
+</html>
