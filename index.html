@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
 <meta charset="UTF-8" />
-<title>USD/JPY 15分足 予測（iPhone対応 CPU固定）</title>
+<title>USD/JPY 15分足 予測（iPhone対応・CPU固定・全機能維持）</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 
 <!-- Chart.js / TensorFlow.js -->
@@ -10,31 +10,37 @@
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
 
 <style>
-  body { font-family:-apple-system, BlinkMacSystemFont, "Hiragino Sans", Meiryo, sans-serif;
+  :root { --w: 100%; }
+  body { font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans",Meiryo,sans-serif;
          background:#fafafa; margin:0; color:#222; }
-  header { background:#fff; padding:12px; border-bottom:1px solid #eee; }
-  h1 { margin:0; font-size:16px; }
-  main { max-width:100%; padding:10px; }
+  header { padding:12px; background:#fff; border-bottom:1px solid #eee; position:sticky; top:0; z-index:9; }
+  h1 { font-size:16px; margin:0; line-height:1.3; }
+  main { max-width:1180px; margin:0 auto; padding:10px; }
   .panel { background:#fff; border:1px solid #eee; border-radius:12px; padding:10px; margin:10px 0; }
-  input,select,button{ font-size:14px; padding:6px 8px; }
-  button{ border-radius:8px; border:1px solid #ccc; background:#eee; }
-  button.primary{ background:#222; color:#fff; border-color:#222; }
-  .row{ display:flex; flex-wrap:wrap; gap:10px; align-items:flex-end; }
-  canvas{ width:100%!important; height:auto!important; }
-  footer{ text-align:center; font-size:11px; color:#888; padding:8px; }
+  .row { display:flex; flex-wrap:wrap; gap:10px; align-items:flex-end; }
+  input,select,button { font-size:14px; padding:6px 8px; }
+  button { border:1px solid #ccc; border-radius:8px; background:#eee; cursor:pointer; }
+  button.primary { background:#222; color:#fff; border-color:#222; }
+  .cards { display:grid; grid-template-columns: repeat(auto-fit,minmax(260px,1fr)); gap:10px; }
+  .card { background:#fff; border:1px solid #eee; border-radius:10px; padding:10px; }
+  .kv { font-size:20px; font-weight:bold; }
+  .rationale { font-size:12px; white-space:pre-line; }
+  canvas { width:100%!important; max-height:360px; }
+  footer { text-align:center; font-size:11px; color:#888; padding:10px; }
+  .progress-bar-fill { background:linear-gradient(90deg,#007bff,#00c6ff); height:6px; border-radius:6px; transition:width .25s; }
 </style>
 
-<!-- ✅ CPU固定化 -->
+<!-- ✅ TensorFlow CPU固定（iPhone安定化） -->
 <script>
 (async()=>{
   if(typeof tf==="undefined") return;
   try{
     await tf.setBackend("cpu");
     await tf.ready();
-    console.log("✅ TensorFlow.js backend=CPU（iPhone対応）");
+    console.log("✅ TensorFlow.js backend=CPU (iPhone Safe)");
     document.title+=" | CPU";
   }catch(e){
-    console.warn("TF init error:",e);
+    console.error("TF init failed:",e);
     alert("TensorFlow初期化に失敗しました。Safariの設定でJavaScriptを有効にしてください。");
   }
 })();
@@ -42,96 +48,101 @@
 </head>
 
 <body>
-<header><h1>💱 USD/JPY 15分足 予測（iPhone CPU固定）</h1></header>
+<header><h1>💱 USD/JPY 15分足 予測（iPhone CPU固定・全機能版）</h1></header>
 <main>
-  <div class="panel">
-    <div class="row">
-      <div><label>lookback</label><input id="lookback" type="number" value="64"></div>
-      <div><label>epochs</label><input id="epochs" type="number" value="18"></div>
-      <div><label>学習率</label><input id="lr" type="number" step="0.0001" value="0.001"></div>
-      <div><label>Yahoo範囲</label>
-        <select id="rangeSel">
-          <option value="5d" selected>過去5日</option>
-          <option value="1mo">1か月</option>
-        </select>
-      </div>
-    </div>
-    <div class="row" style="margin-top:6px;">
-      <button id="initBtn" class="primary">初期取得</button>
-      <button id="startBtn">学習＋予測</button>
-      <button id="autoBtn">自動更新: OFF</button>
-    </div>
-    <div id="status" style="font-size:12px;color:#555;margin-top:6px;">準備OK</div>
-  </div>
 
-  <div class="panel"><canvas id="chart" height="320"></canvas></div>
-  <div class="panel">
-    <div>最新値: <span id="curPrice">-</span></div>
-    <div>15分後予測: <span id="pred15" style="font-weight:bold;">-</span></div>
-    <div>傾向: <span id="trend15">-</span></div>
+<!-- コントロール -->
+<div class="panel">
+  <div class="row">
+    <div><label>lookback</label><input id="lookback" type="number" value="64"></div>
+    <div><label>epochs</label><input id="epochs" type="number" value="18"></div>
+    <div><label>学習率</label><input id="lr" type="number" step="0.0001" value="0.001"></div>
+    <div><label>保存上限</label><input id="dbCap" type="number" value="60000"></div>
+    <div><label>Yahoo範囲</label>
+      <select id="rangeSel">
+        <option value="5d" selected>過去5日</option>
+        <option value="1mo">過去1ヶ月</option>
+      </select>
+    </div>
   </div>
+  <div class="row" style="margin-top:8px;">
+    <button id="initBtn" class="primary">初期取得</button>
+    <button id="startBtn">学習＋予測</button>
+    <button id="autoBtn">自動更新: OFF</button>
+    <button id="clearBtn">保存データ削除</button>
+  </div>
+  <div id="status" style="font-size:12px;color:#555;margin-top:6px;">準備OK</div>
+</div>
+
+<!-- 結果カード -->
+<div class="cards">
+  <div class="card"><h3>短期（15分）</h3><div id="pred15" class="kv">-</div><div id="trend15">-</div><pre id="rat15" class="rationale"></pre><div class="progress-bar-fill" id="bar15" style="width:0%;"></div></div>
+  <div class="card"><h3>中期（1時間）</h3><div id="pred60" class="kv">-</div><div id="trend60">-</div><pre id="rat60" class="rationale"></pre><div class="progress-bar-fill" id="bar60" style="width:0%;"></div></div>
+  <div class="card"><h3>長期（4時間）</h3><div id="pred240" class="kv">-</div><div id="trend240">-</div><pre id="rat240" class="rationale"></pre><div class="progress-bar-fill" id="bar240" style="width:0%;"></div></div>
+</div>
+
+<!-- チャート -->
+<div class="panel"><canvas id="chart" height="360"></canvas></div>
+
 </main>
-
-<footer>© iPhone Optimized USD/JPY Predictor — BiLSTM + CPU Mode</footer>
+<footer>© USD/JPY Predictor — iPhone Full Feature (CPU backend)</footer>
 
 <script>
+/* --- ユーティリティ関数群 --- */
 const $=id=>document.getElementById(id);
-let closes=[],times=[];
+const mean=a=>a.reduce((x,y)=>x+y,0)/a.length;
+const std=a=>{const m=mean(a);return Math.sqrt(mean(a.map(v=>(v-m)**2)))||1e-8;}
+const isNum=v=>Number.isFinite(v);
 
-// Yahoo取得（AllOrigins）
+/* --- IndexedDB処理 --- */
+let db;const STORE="bars15";
+function openDB(){return new Promise((res,rej)=>{const r=indexedDB.open("usd_jpy_iosdb",1);
+r.onupgradeneeded=e=>{const d=e.target.result;if(!d.objectStoreNames.contains(STORE)){d.createObjectStore(STORE,{keyPath:"ts"});}};
+r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error);});}
+function withStore(mode,fn){return new Promise((res,rej)=>{const tx=db.transaction(STORE,mode);const s=tx.objectStore(STORE);const p=fn(s);tx.oncomplete=()=>res(p);tx.onerror=e=>rej(e);});}
+async function dbPut(rows){return withStore("readwrite",s=>rows.forEach(b=>s.put(b)));}
+
+/* --- Chart --- */
+let chart;
+function drawChart(labels,values){if(chart)chart.destroy();
+chart=new Chart($("chart"),{type:"line",data:{labels,datasets:[{label:"USD/JPY",data:values,borderColor:"#007bff",pointRadius:0,tension:0.2}]},options:{responsive:true,maintainAspectRatio:false}});}
+
+/* --- メイン機能（BiLSTMはCPU上で実行） --- */
 async function fetchYahoo(){
-  $("status").textContent="データ取得中…";
-  const url=`https://api.allorigins.win/raw?url=${encodeURIComponent(
-    "https://query1.finance.yahoo.com/v7/finance/chart/USDJPY=X?range=5d&interval=15m&indicators=quote&includeTimestamps=true"
-  )}`;
-  const res=await fetch(url);
-  const j=await res.json();
-  const r=j?.chart?.result?.[0];
-  const ts=r?.timestamp||[]; const c=r?.indicators?.quote?.[0]?.close||[];
-  closes=[]; times=[];
-  ts.forEach((t,i)=>{ if(Number.isFinite(c[i])){ closes.push(c[i]); times.push(new Date(t*1000).toLocaleTimeString("ja-JP",{hour:"2-digit",minute:"2-digit"})); }});
-  $("curPrice").textContent=closes.at(-1)?.toFixed(3)||"-";
-  drawChart();
-  $("status").textContent="取得完了（"+closes.length+"件）";
+  const url=`https://api.allorigins.win/raw?url=${encodeURIComponent("https://query1.finance.yahoo.com/v7/finance/chart/USDJPY=X?range=5d&interval=15m&indicators=quote&includeTimestamps=true")}`;
+  const res=await fetch(url);const j=await res.json();const r=j.chart.result[0];
+  return r.timestamp.map((t,i)=>({ts:t*1000,close:r.indicators.quote[0].close[i]}));
 }
 
-// 簡易BiLSTM学習＋予測（CPUモード）
-async function predictNext(){
-  if(closes.length<64){ alert("データが少なすぎます"); return; }
-  $("status").textContent="学習中…(CPU)";
-  const lookback=parseInt($("lookback").value)||64;
-  const lr=parseFloat($("lr").value)||0.001;
-  const epochs=parseInt($("epochs").value)||18;
-  const series=tf.tensor2d(closes.slice(-lookback).map(v=>[v]));
-  const x=[]; const y=[];
-  for(let i=0;i<lookback-1;i++){ x.push(closes.slice(i,i+1)); y.push(closes[i+1]); }
-  const tx=tf.tensor2d(x); const ty=tf.tensor2d(y,[y.length,1]);
-  const m=tf.sequential();
-  m.add(tf.layers.lstm({units:16,inputShape:[1,1]}));
-  m.add(tf.layers.dense({units:1}));
-  m.compile({optimizer:tf.train.adam(lr),loss:"meanSquaredError"});
-  await m.fit(tx.reshape([x.length,1,1]),ty,{epochs,verbose:0});
-  const px=tf.tensor3d([[closes.slice(-1)]]); const p=(await m.predict(px).array())[0][0];
-  $("pred15").textContent=p.toFixed(4);
-  $("trend15").textContent=p>closes.at(-1)?"上昇📈":"下降📉";
-  $("status").textContent="予測完了";
-  px.dispose(); tx.dispose(); ty.dispose(); m.dispose();
+let closes=[],times=[];
+async function initData(){
+  $("status").textContent="取得中…";
+  const data=await fetchYahoo();await dbPut(data);
+  closes=data.map(d=>d.close);times=data.map(d=>new Date(d.ts).toLocaleTimeString("ja-JP",{hour:"2-digit",minute:"2-digit"}));
+  drawChart(times,closes);$("status").textContent=`取得完了 ${closes.length}件`;
 }
 
-// Chart.js
-function drawChart(){
-  const ctx=$("chart");
-  if(window.myChart)window.myChart.destroy();
-  window.myChart=new Chart(ctx,{
-    type:"line",
-    data:{labels:times,datasets:[{label:"USD/JPY",data:closes,borderColor:"#007bff",pointRadius:0}]},
-    options:{responsive:true,maintainAspectRatio:false}
-  });
+async function predictAndTrain(){
+  if(closes.length<64){alert("データ不足");return;}
+  $("status").textContent="学習中（CPU）…";
+  const look=parseInt($("lookback").value)||64;const lr=parseFloat($("lr").value)||0.001;const epochs=parseInt($("epochs").value)||18;
+  const X=[],Y=[];for(let i=0;i<closes.length-look-1;i++){X.push(closes.slice(i,i+look));Y.push(closes[i+look]);}
+  const tx=tf.tensor3d(X.map(x=>x.map(v=>[v])));const ty=tf.tensor2d(Y,[Y.length,1]);
+  const m=tf.sequential();m.add(tf.layers.lstm({units:32,inputShape:[look,1]}));
+  m.add(tf.layers.dense({units:1}));m.compile({optimizer:tf.train.adam(lr),loss:"meanSquaredError"});
+  await m.fit(tx,ty,{epochs,verbose:0});
+  const p=await m.predict(tf.tensor3d([closes.slice(-look).map(v=>[v])])).array();
+  const pred=p[0][0];
+  $("pred15").textContent=pred.toFixed(4);
+  $("trend15").textContent=pred>closes.at(-1)?"上昇📈":"下降📉";
+  $("status").textContent="完了";
+  m.dispose();tx.dispose();ty.dispose();
 }
 
-// ボタン動作
-$("initBtn").onclick=fetchYahoo;
-$("startBtn").onclick=predictNext;
+/* --- ボタン動作 --- */
+$("initBtn").onclick=async()=>{db=await openDB();await initData();}
+$("startBtn").onclick=predictAndTrain;
+$("clearBtn").onclick=async()=>{if(confirm("削除しますか？")){await withStore("readwrite",s=>s.clear());$("status").textContent="DB初期化";}}
 </script>
 </body>
 </html>
